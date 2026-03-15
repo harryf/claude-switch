@@ -136,18 +136,6 @@ Desktop encrypts OAuth tokens in `config.json` using Electron's `safeStorage` AP
 
 ---
 
-## publish.sh (Development Workflow)
-
-The publish script automates syncing local script edits into the git repo:
-
-1. **Copy** — Copies `claude-switch` and `claude-switch-desktop` from `~/bin` into the repo directory.
-2. **PII Check** — Reads patterns from `.pii-patterns` (one grep pattern per line) and checks the scripts for matches. Aborts if any personal data is found.
-3. **Commit** — Shows a `git diff --stat`, prompts for confirmation, then `git add`, `git commit -m "Sync scripts from ~/bin"`, and `git push`.
-
-This workflow assumes development happens on the live scripts in `~/bin` and the repo is the publication target.
-
----
-
 ## Security Considerations
 
 - Auth tokens are stored with `chmod 600` (owner-only read/write)
