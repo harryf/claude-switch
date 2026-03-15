@@ -231,20 +231,6 @@ The `--refresh` command runs `claude auth login`, validates the new token, persi
 
 ---
 
-## Development
-
-If you're working on the scripts locally and want to publish changes:
-
-```bash
-# Edit scripts in ~/bin (or wherever they live on your PATH)
-# Then sync to this repo:
-./publish.sh
-```
-
-`publish.sh` copies the scripts from `~/bin`, checks for PII leaks (patterns in `.pii-patterns`), and optionally commits and pushes. Create a `.pii-patterns` file with one grep pattern per line (e.g., your email address) — these are checked against the scripts to prevent accidental publication of personal data.
-
----
-
 ## License
 
 MIT
