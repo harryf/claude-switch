@@ -1,0 +1,414 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Claude Desktop Profile Switcher
+# Usage: claude-switch-desktop personal|work|status|init|--refresh|--save
+
+CLAUDE_DESKTOP_DIR="$HOME/Library/Application Support/Claude"
+PROFILES_DIR="$HOME/.claude-desktop-profiles"
+ACTIVE_FILE="$PROFILES_DIR/.active"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+SWAP_FILES=(
+    "config.json"
+    "Local Storage"
+    "Cookies"
+    "Cookies-journal"
+    "IndexedDB"
+    "Session Storage"
+    "blob_storage"
+    "WebStorage"
+    "local-agent-mode-sessions"
+    "shared_proto_db"
+    "ant-did"
+    "DIPS"
+    "Trust Tokens"
+    "Network Persistent State"
+)
+
+usage() {
+    echo "Usage: claude-switch-desktop <command>"
+    echo ""
+    echo "  personal           Switch to personal profile"
+    echo "  work               Switch to work profile"
+    echo "  status             Show which profile is active"
+    echo "  init               First-time setup (capture both Desktop profiles)"
+    echo "  --refresh          Re-login current Desktop profile and update snapshot"
+    echo "  --refresh <profile> Print instructions for refreshing a different profile"
+    echo "  --save             Capture current Desktop state to active profile's snapshot"
+    exit 1
+}
+
+get_current() {
+    if [ -f "$ACTIVE_FILE" ]; then
+        cat "$ACTIVE_FILE"
+    else
+        echo "unknown"
+    fi
+}
+
+save_desktop_profile() {
+    local profile="$1"
+    local dest="$PROFILES_DIR/$profile"
+    mkdir -p "$dest"
+    for f in "${SWAP_FILES[@]}"; do
+        if [ -e "$CLAUDE_DESKTOP_DIR/$f" ]; then
+            rm -rf "$dest/$f"
+            cp -a "$CLAUDE_DESKTOP_DIR/$f" "$dest/$f"
+        fi
+    done
+}
+
+load_desktop_profile() {
+    local profile="$1"
+    local src="$PROFILES_DIR/$profile"
+    if [ ! -d "$src" ]; then
+        echo -e "${YELLOW}WARNING: No Claude Desktop profile for $profile.${NC}"
+        echo "Launch Claude Desktop, sign in, then switch away and back to capture it."
+        return 1
+    fi
+    # Check that the profile has a config.json (minimum viable profile)
+    if [ ! -f "$src/config.json" ]; then
+        echo -e "${YELLOW}WARNING: Profile $profile has no config.json — may not be captured yet.${NC}"
+        return 1
+    fi
+    for f in "${SWAP_FILES[@]}"; do
+        if [ -e "$src/$f" ]; then
+            rm -rf "$CLAUDE_DESKTOP_DIR/$f"
+            cp -a "$src/$f" "$CLAUDE_DESKTOP_DIR/$f"
+        fi
+    done
+}
+
+quit_claude_desktop() {
+    if pgrep -xq "Claude"; then
+        echo "Quitting Claude Desktop..."
+        osascript -e 'tell application "Claude" to quit' 2>/dev/null || true
+        local i=0
+        while pgrep -xq "Claude" && [ $i -lt 10 ]; do
+            sleep 0.5
+            ((i++))
+        done
+        if pgrep -xq "Claude"; then
+            echo -e "${RED}Claude Desktop didn't quit. Kill it manually or run: killall Claude${NC}"
+            return 1
+        fi
+        echo "Claude Desktop quit."
+    fi
+}
+
+# Read account info from Claude Code's .profile-meta for a given profile name
+get_account_display() {
+    local profile="$1"
+    local code_profile_dir="$HOME/.claude-${profile}"
+    local meta_file="$code_profile_dir/.profile-meta"
+    if [ -f "$meta_file" ]; then
+        local PROFILE_EMAIL="" PROFILE_ORG="" PROFILE_SUB_TYPE=""
+        source "$meta_file"
+        if [ -n "$PROFILE_ORG" ]; then
+            echo "$PROFILE_EMAIL ($PROFILE_ORG)"
+        elif [ -n "$PROFILE_EMAIL" ] && [ "$PROFILE_EMAIL" != "unknown" ]; then
+            echo "$PROFILE_EMAIL"
+        else
+            echo ""
+        fi
+    else
+        echo ""
+    fi
+}
+
+show_status() {
+    local current
+    current="$(get_current)"
+
+    echo -e "  Profile:   ${GREEN}$current${NC}"
+
+    # Read account info from the active config.json
+    if [ -f "$CLAUDE_DESKTOP_DIR/config.json" ]; then
+        local has_token config_file="$CLAUDE_DESKTOP_DIR/config.json"
+        has_token="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print('yes' if 'oauth:tokenCache' in d else 'no')" "$config_file" 2>/dev/null || echo "no")"
+        if [ "$has_token" = "yes" ]; then
+            echo "  Token:     present (encrypted)"
+        else
+            echo -e "  Token:     ${YELLOW}missing${NC}"
+        fi
+    else
+        echo -e "  Config:    ${YELLOW}no config.json found${NC}"
+    fi
+
+    # Get account display from Claude Code's .profile-meta
+    if [ "$current" != "unknown" ]; then
+        local display
+        display="$(get_account_display "$current")"
+        if [ -n "$display" ]; then
+            echo "  Account:   $display"
+        else
+            echo -e "  Account:   ${YELLOW}unknown — run 'claude-switch --save' to capture account info${NC}"
+        fi
+    else
+        echo -e "  Account:   ${YELLOW}unknown — run a switch to set tracking${NC}"
+    fi
+}
+
+# --save: capture current Desktop state to active profile's snapshot
+save_snapshot_cmd() {
+    local current
+    current="$(get_current)"
+    if [ "$current" = "unknown" ]; then
+        echo -e "${RED}ERROR: No active profile tracked. Run a switch first.${NC}"
+        exit 1
+    fi
+
+    quit_claude_desktop || exit 1
+
+    echo "Saving current Desktop state to $current profile snapshot..."
+    save_desktop_profile "$current"
+
+    echo -e "${GREEN}Desktop profile snapshot updated ($current).${NC}"
+    show_status
+}
+
+# --refresh [profile]: re-login Desktop and update snapshot
+refresh_cmd() {
+    local target_profile="${1:-}"
+    local current
+    current="$(get_current)"
+
+    if [ -z "$target_profile" ] || [ "$target_profile" = "$current" ]; then
+        refresh_current "$current"
+    else
+        refresh_other "$target_profile" "$current"
+    fi
+}
+
+refresh_current() {
+    local profile="$1"
+
+    echo "Refreshing Claude Desktop credentials for current profile ($profile)..."
+    echo ""
+    echo "Please re-authenticate in Claude Desktop:"
+    echo "  1. Open Claude Desktop (if not already open)"
+    echo "  2. Click profile icon → Sign out"
+    echo "  3. Sign back in as the $profile account"
+    echo ""
+    echo -n "Press Enter when done... "
+    read -r
+
+    quit_claude_desktop || exit 1
+
+    echo "Saving updated desktop profile ($profile)..."
+    save_desktop_profile "$profile"
+
+    echo ""
+    echo -e "${GREEN}Desktop profile snapshot updated ($profile).${NC}"
+    show_status
+}
+
+refresh_other() {
+    local target_profile="$1"
+    local current_profile="$2"
+
+    echo "To refresh the $target_profile Desktop profile:"
+    echo ""
+    echo "  1. claude-switch-desktop $target_profile"
+    echo "  2. Re-authenticate in Claude Desktop"
+    echo "  3. claude-switch-desktop $current_profile"
+    echo ""
+    echo "(Cross-profile Desktop refresh requires a full profile swap"
+    echo " because Desktop auth is interactive inside the app.)"
+}
+
+# init: first-time interactive setup for Desktop profiles
+init_cmd() {
+    echo "Claude Desktop Profile Switcher — First-Time Setup"
+    echo "==================================================="
+    echo ""
+
+    # Check if Code profiles exist (needed for account display)
+    if [ ! -d "$HOME/.claude-work" ] && [ ! -d "$HOME/.claude-personal" ]; then
+        echo -e "${YELLOW}No Claude Code profiles found.${NC}"
+        echo "Run 'claude-switch init' first to set up Code profiles,"
+        echo "then come back here to set up Desktop profiles."
+        exit 1
+    fi
+
+    # Check if already initialized
+    if [ -f "$ACTIVE_FILE" ]; then
+        echo -e "${YELLOW}Desktop profiles already exist.${NC}"
+        echo "  Active: $(get_current)"
+        echo ""
+        echo -n "  Re-initialize? This will overwrite saved profiles. (y/N) "
+        read -r confirm
+        [ "$confirm" = "y" ] || exit 0
+        echo ""
+    fi
+
+    mkdir -p "$PROFILES_DIR"
+
+    echo "This will capture Claude Desktop's auth state for both accounts."
+    echo "You'll sign into each account inside Claude Desktop, and this"
+    echo "script will snapshot the relevant files."
+    echo ""
+
+    # ──────────────────────────────────────────────────────────────
+    # Step 1: Capture first account
+    # ──────────────────────────────────────────────────────────────
+    echo -e "${BLUE}Step 1 of 3: Capture first account${NC}"
+    echo "───────────────────────────────────"
+    echo ""
+    echo "  Make sure Claude Desktop is open and signed into your"
+    echo "  first account (e.g., your work account)."
+    echo ""
+
+    # Show which Code profiles exist to help the user identify
+    for profile_name in work personal; do
+        local display
+        display="$(get_account_display "$profile_name")"
+        if [ -n "$display" ]; then
+            echo "    $profile_name: $display"
+        fi
+    done
+    echo ""
+
+    echo -n "  Press Enter when Claude Desktop is signed in... "
+    read -r
+
+    quit_claude_desktop || exit 1
+
+    echo "  Capturing Desktop state..."
+
+    # Ask which profile this is
+    echo -n "  Which account is Desktop signed into? [work]: "
+    read -r name1
+    name1="${name1:-work}"
+
+    save_desktop_profile "$name1"
+    echo -e "  ${GREEN}Captured $name1 Desktop profile.${NC}"
+
+    echo ""
+
+    # ──────────────────────────────────────────────────────────────
+    # Step 2: Sign into second account
+    # ──────────────────────────────────────────────────────────────
+    echo -e "${BLUE}Step 2 of 3: Sign into second account${NC}"
+    echo "──────────────────────────────────────"
+    echo ""
+
+    local other="personal"
+    [ "$name1" = "personal" ] && other="work"
+
+    local other_display
+    other_display="$(get_account_display "$other")"
+    if [ -n "$other_display" ]; then
+        echo "  Now sign into your $other account ($other_display)."
+    else
+        echo "  Now sign into your $other account."
+    fi
+    echo ""
+    echo "    1. Open Claude Desktop:  open -a Claude"
+    echo "    2. Click your profile icon (bottom-left) → Log out"
+    echo "    3. Sign in with your $other account"
+    echo ""
+    echo -n "  Press Enter when you've signed into the $other account... "
+    read -r
+
+    echo ""
+
+    # ──────────────────────────────────────────────────────────────
+    # Step 3: Capture second account
+    # ──────────────────────────────────────────────────────────────
+    echo -e "${BLUE}Step 3 of 3: Capture second account${NC}"
+    echo "────────────────────────────────────"
+    echo ""
+
+    quit_claude_desktop || exit 1
+
+    echo "  Capturing Desktop state..."
+    save_desktop_profile "$other"
+    echo -e "  ${GREEN}Captured $other Desktop profile.${NC}"
+
+    echo ""
+
+    # Set active profile
+    echo -n "  Which profile should be active? [$name1]: "
+    read -r active
+    active="${active:-$name1}"
+
+    # Load the chosen profile
+    load_desktop_profile "$active" || {
+        echo -e "${RED}Failed to load $active profile.${NC}"
+        exit 1
+    }
+    echo "$active" > "$ACTIVE_FILE"
+
+    echo ""
+    echo -e "${GREEN}════════════════════════════════════════${NC}"
+    echo -e "${GREEN}  Desktop setup complete!${NC}"
+    echo -e "${GREEN}════════════════════════════════════════${NC}"
+    echo ""
+    show_status
+    echo ""
+    echo "  Switch profiles:  claude-switch-desktop $name1"
+    echo "                    claude-switch-desktop $other"
+    echo "  Then launch:      open -a Claude"
+}
+
+switch_profile() {
+    local target_profile="$1"
+    local current
+    current="$(get_current)"
+
+    if [ "$current" = "$target_profile" ]; then
+        echo -e "${BLUE}Already on $target_profile profile.${NC}"
+        show_status
+        return
+    fi
+
+    # Claude Desktop must be quit before swapping files
+    quit_claude_desktop || exit 1
+
+    # Save current profile before switching
+    if [ "$current" != "unknown" ]; then
+        echo "Saving current ($current) desktop profile..."
+        save_desktop_profile "$current"
+    fi
+
+    # Load target profile
+    echo "Loading $target_profile desktop profile..."
+    load_desktop_profile "$target_profile" || exit 1
+
+    # Track active profile
+    echo "$target_profile" > "$ACTIVE_FILE"
+
+    echo ""
+    echo -e "${GREEN}Switched Claude Desktop to $target_profile.${NC}"
+    show_status
+
+    echo ""
+    echo "Launch Claude Desktop with: open -a Claude"
+}
+
+# Main
+case "${1:-}" in
+    personal|work) switch_profile "$1" ;;
+    status)
+        echo "Claude Desktop Profile Status"
+        echo "=============================="
+        show_status
+        ;;
+    init)
+        init_cmd
+        ;;
+    --refresh)
+        refresh_cmd "${2:-}"
+        ;;
+    --save)
+        save_snapshot_cmd
+        ;;
+    *) usage ;;
+esac

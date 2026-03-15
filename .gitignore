@@ -1,0 +1,9 @@
+# Personal PII patterns (contains your email, etc.)
+.pii-patterns
+
+# Internal working docs (contain personal references)
+CLAUDE-DESKTOP.md
+DEPERSONALIZE.md
+RELOGIN.md
+switching-anthropic-accounts.md
+publish.sh

@@ -1,0 +1,748 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Claude Code Profile Switcher
+# Usage: claude-switch personal|work|status|init|--refresh|--save
+
+PERSONAL_DIR="$HOME/.claude-personal"
+WORK_DIR="$HOME/.claude-work"
+LINK="$HOME/.claude"
+KEYCHAIN_SERVICE="Claude Code-credentials"
+KEYCHAIN_ACCOUNT="$(whoami)"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+usage() {
+    echo "Usage: claude-switch <command>"
+    echo ""
+    echo "  personal           Switch to personal profile"
+    echo "  work               Switch to work profile"
+    echo "  status             Show which profile is active"
+    echo "  init               First-time setup (create profiles, capture tokens)"
+    echo "  --refresh          Re-login current profile and persist new token"
+    echo "  --refresh <profile> Re-login a specific profile without leaving current one"
+    echo "  --save             Persist current keychain token to active profile"
+    exit 1
+}
+
+# ─── Profile helpers ───────────────────────────────────────────────
+
+get_current() {
+    if [ -L "$LINK" ]; then
+        local target
+        target="$(readlink "$LINK")"
+        case "$target" in
+            *-personal*) echo "personal" ;;
+            *-work*)     echo "work" ;;
+            *)           echo "unknown" ;;
+        esac
+    elif [ -d "$LINK" ]; then
+        echo "ERROR: ~/.claude is a real directory, not a symlink."
+        echo "Run 'claude-switch init' to set up profiles."
+        exit 1
+    else
+        echo "ERROR: ~/.claude does not exist."
+        exit 1
+    fi
+}
+
+get_profile_dir() {
+    case "$1" in
+        personal) echo "$PERSONAL_DIR" ;;
+        work)     echo "$WORK_DIR" ;;
+    esac
+}
+
+# ─── Token helpers ─────────────────────────────────────────────────
+
+get_token_sub_type() {
+    local token="$1"
+    echo "$token" | python3 -c "import sys,json; print(json.load(sys.stdin).get('claudeAiOauth',{}).get('subscriptionType',''))" 2>/dev/null || echo ""
+}
+
+save_current_token() {
+    local profile_dir="$1"
+    local token
+    token="$(security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null || true)"
+    if [ -n "$token" ]; then
+        echo "$token" > "$profile_dir/.auth-token"
+        chmod 600 "$profile_dir/.auth-token"
+    fi
+}
+
+load_token() {
+    local profile_dir="$1"
+    local token_file="$profile_dir/.auth-token"
+    if [ ! -f "$token_file" ]; then
+        echo -e "${YELLOW}WARNING: No auth token found for this profile.${NC}"
+        echo "Run 'claude-switch --refresh' to authenticate."
+        return
+    fi
+    local token
+    token="$(cat "$token_file")"
+    security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" >/dev/null 2>&1 || true
+    security add-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w "$token"
+}
+
+restore_keychain_token() {
+    local token="$1"
+    security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" >/dev/null 2>&1 || true
+    security add-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w "$token"
+}
+
+# ─── Profile metadata (.profile-meta) ─────────────────────────────
+
+# Read .profile-meta into PROFILE_EMAIL, PROFILE_ORG, PROFILE_SUB_TYPE
+# Returns 1 if no meta file exists
+load_profile_meta() {
+    local profile_dir="$1"
+    local meta_file="$profile_dir/.profile-meta"
+    PROFILE_EMAIL=""
+    PROFILE_ORG=""
+    PROFILE_SUB_TYPE=""
+    if [ -f "$meta_file" ]; then
+        source "$meta_file"
+        return 0
+    fi
+    return 1
+}
+
+# Introspect current keychain token via claude auth status.
+# WARNING: `claude auth status` reads from the running process's in-memory
+# state, NOT the keychain. Only reliable right after `claude auth login`.
+# Sets globals: _EMAIL, _ORG, _SUB_TYPE, _DISPLAY
+introspect_token() {
+    local token="$1"
+    _SUB_TYPE="$(get_token_sub_type "$token")"
+    local auth_json
+    auth_json="$(claude auth status 2>/dev/null || echo '{}')"
+    _EMAIL="$(echo "$auth_json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('email','unknown'))" 2>/dev/null || echo "unknown")"
+    _ORG="$(echo "$auth_json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('orgName',''))" 2>/dev/null || echo "")"
+    _DISPLAY="$_EMAIL"
+    [ -n "$_ORG" ] && _DISPLAY="$_EMAIL ($_ORG, $_SUB_TYPE)" || _DISPLAY="$_EMAIL ($_SUB_TYPE)"
+}
+
+# Write .profile-meta with explicit values (no API calls).
+# Use this when you already have the email/org/sub_type.
+write_profile_meta() {
+    local profile_dir="$1" email="$2" org="$3" sub_type="$4"
+    cat > "$profile_dir/.profile-meta" <<META
+PROFILE_EMAIL="$email"
+PROFILE_ORG="$org"
+PROFILE_SUB_TYPE="$sub_type"
+META
+    chmod 600 "$profile_dir/.profile-meta"
+}
+
+# Query claude auth status and write .profile-meta for a profile directory.
+# WARNING: `claude auth status` reads from the running process's in-memory
+# state, NOT the keychain. Only call this when you just ran `claude auth login`
+# so the process state matches the keychain. For other cases (e.g., after
+# restoring a saved token), use write_profile_meta with explicit values.
+update_profile_meta() {
+    local profile_dir="$1"
+    local token
+    token="$(security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null || true)"
+    introspect_token "$token"
+    write_profile_meta "$profile_dir" "$_EMAIL" "$_ORG" "$_SUB_TYPE"
+}
+
+# Expected subscription type for a profile (read from .profile-meta)
+expected_sub_type() {
+    local profile="$1"
+    local profile_dir
+    profile_dir="$(get_profile_dir "$profile")"
+    if load_profile_meta "$profile_dir"; then
+        echo "$PROFILE_SUB_TYPE"
+    else
+        echo ""
+    fi
+}
+
+# Format account display from .profile-meta
+format_account_display() {
+    local profile_dir="$1"
+    local sub_type="$2"
+    if load_profile_meta "$profile_dir"; then
+        if [ -n "$PROFILE_ORG" ]; then
+            echo "$PROFILE_EMAIL ($PROFILE_ORG, $sub_type)"
+        elif [ -n "$PROFILE_EMAIL" ] && [ "$PROFILE_EMAIL" != "unknown" ]; then
+            echo "$PROFILE_EMAIL ($sub_type)"
+        else
+            echo "subscriptionType: $sub_type (run 'claude-switch --save' to capture account info)"
+        fi
+    else
+        echo "subscriptionType: $sub_type (run 'claude-switch --save' to capture account info)"
+    fi
+}
+
+# ─── Commands ──────────────────────────────────────────────────────
+
+check_claude_processes() {
+    local pids
+    pids="$(pgrep -f 'claude' 2>/dev/null || true)"
+    if [ -n "$pids" ]; then
+        echo -e "${YELLOW}WARNING: Claude Code processes detected. Restart them after switching.${NC}"
+    fi
+}
+
+show_status() {
+    local current
+    current="$(get_current)"
+    local target_dir
+    target_dir="$(readlink "$LINK")"
+
+    echo -e "  Profile:   ${GREEN}$current${NC}"
+    echo "  Directory: $target_dir"
+
+    # Show auth info from keychain token directly (not `claude auth status`
+    # which may reflect a running process's in-memory state)
+    local token
+    token="$(security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null || true)"
+    if [ -n "$token" ]; then
+        local sub_type
+        sub_type="$(get_token_sub_type "$token")"
+        [ -z "$sub_type" ] && sub_type="unknown"
+        local display
+        display="$(format_account_display "$target_dir" "$sub_type")"
+        echo "  Account:   $display"
+    else
+        echo -e "  Account:   ${YELLOW}no keychain token found${NC}"
+    fi
+}
+
+switch_profile() {
+    local target_profile="$1"
+    local target_dir
+    target_dir="$(get_profile_dir "$target_profile")"
+
+    if [ ! -d "$target_dir" ]; then
+        echo -e "${RED}ERROR: Profile directory $target_dir does not exist.${NC}"
+        echo "Run 'claude-switch init' first."
+        exit 1
+    fi
+
+    # Check if already on this profile
+    local current
+    current="$(get_current)"
+    if [ "$current" = "$target_profile" ]; then
+        echo -e "${BLUE}Already on $target_profile profile.${NC}"
+        show_status
+        return
+    fi
+
+    check_claude_processes
+
+    # Save current token before switching
+    echo "Saving current auth token..."
+    local current_dir
+    current_dir="$(readlink "$LINK")"
+    save_current_token "$current_dir"
+
+    # Swap symlink
+    echo "Switching to $target_profile..."
+    rm "$LINK"
+    ln -s "$target_dir" "$LINK"
+
+    # Load target profile's token into keychain
+    echo "Loading $target_profile credentials..."
+    load_token "$target_dir"
+
+    echo ""
+    echo -e "${GREEN}Switched to $target_profile profile.${NC}"
+    show_status
+
+    echo ""
+    echo -e "${YELLOW}NOTE: Restart any running Claude Code sessions for changes to take effect.${NC}"
+}
+
+# --save: persist current keychain token and metadata to active profile
+save_token_cmd() {
+    local current
+    current="$(get_current)"
+    local current_dir
+    current_dir="$(readlink "$LINK")"
+
+    local token
+    token="$(security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null || true)"
+    if [ -z "$token" ]; then
+        echo -e "${RED}ERROR: No token found in keychain.${NC}"
+        exit 1
+    fi
+
+    echo "$token" > "$current_dir/.auth-token"
+    chmod 600 "$current_dir/.auth-token"
+
+    # Also update profile metadata
+    echo "Querying account info..."
+    update_profile_meta "$current_dir"
+
+    local sub_type
+    sub_type="$(get_token_sub_type "$token")"
+    echo -e "${GREEN}Saved to $current_dir${NC}"
+    echo "  Profile: $current"
+    local display
+    display="$(format_account_display "$current_dir" "$sub_type")"
+    echo "  Account: $display"
+}
+
+# --refresh [profile]: re-login and persist
+refresh_cmd() {
+    local target_profile="${1:-}"
+    local current
+    current="$(get_current)"
+
+    if [ -z "$target_profile" ] || [ "$target_profile" = "$current" ]; then
+        refresh_current "$current"
+    else
+        refresh_other "$target_profile" "$current"
+    fi
+}
+
+refresh_current() {
+    local profile="$1"
+    local profile_dir
+    profile_dir="$(get_profile_dir "$profile")"
+
+    echo "Refreshing credentials for current profile ($profile)..."
+    echo ""
+
+    # Run interactive login
+    claude auth login
+    local login_exit=$?
+    if [ $login_exit -ne 0 ]; then
+        echo -e "${RED}ERROR: claude auth login failed (exit $login_exit).${NC}"
+        echo "Existing .auth-token was NOT modified."
+        exit 1
+    fi
+
+    # Validate the new token
+    local token
+    token="$(security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null || true)"
+    if [ -z "$token" ]; then
+        echo -e "${RED}ERROR: No token found in keychain after login.${NC}"
+        exit 1
+    fi
+
+    local sub_type
+    sub_type="$(get_token_sub_type "$token")"
+    if [ -z "$sub_type" ]; then
+        echo -e "${RED}ERROR: Token doesn't contain valid OAuth data.${NC}"
+        exit 1
+    fi
+
+    # Warn if subscription type doesn't match expected
+    local expected
+    expected="$(expected_sub_type "$profile")"
+    if [ -n "$expected" ] && [ "$sub_type" != "$expected" ]; then
+        echo -e "${YELLOW}WARNING: Expected $expected token for $profile profile, got: $sub_type${NC}"
+        echo "Did you sign in with the correct account?"
+        echo -n "Proceed anyway? (y/N) "
+        read -r confirm
+        [ "$confirm" = "y" ] || exit 1
+    fi
+
+    # Persist token and metadata
+    echo "$token" > "$profile_dir/.auth-token"
+    chmod 600 "$profile_dir/.auth-token"
+    update_profile_meta "$profile_dir"
+
+    echo ""
+    echo -e "${GREEN}New token saved to $profile_dir/.auth-token${NC}"
+    show_status
+}
+
+refresh_other() {
+    local target_profile="$1"
+    local current_profile="$2"
+    local target_dir
+    target_dir="$(get_profile_dir "$target_profile")"
+
+    if [ ! -d "$target_dir" ]; then
+        echo -e "${RED}ERROR: Profile directory $target_dir does not exist.${NC}"
+        exit 1
+    fi
+
+    echo "Refreshing credentials for $target_profile profile..."
+    echo "(Your current $current_profile session will be preserved)"
+    echo ""
+
+    # Save current keychain token so we can restore it
+    local original_token
+    original_token="$(security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null || true)"
+    if [ -z "$original_token" ]; then
+        echo -e "${RED}ERROR: No current token in keychain to preserve.${NC}"
+        exit 1
+    fi
+
+    # Trap to restore keychain on any failure
+    trap 'echo ""; echo "Restoring $current_profile credentials..."; restore_keychain_token "$original_token"; echo "Restored."' EXIT
+
+    # Run interactive login (user authenticates as the target account)
+    claude auth login
+    local login_exit=$?
+    if [ $login_exit -ne 0 ]; then
+        echo -e "${RED}ERROR: claude auth login failed (exit $login_exit).${NC}"
+        echo "Existing .auth-token was NOT modified."
+        exit 1
+    fi
+
+    # Validate the new token
+    local token
+    token="$(security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null || true)"
+    if [ -z "$token" ]; then
+        echo -e "${RED}ERROR: No token found in keychain after login.${NC}"
+        exit 1
+    fi
+
+    local sub_type
+    sub_type="$(get_token_sub_type "$token")"
+    if [ -z "$sub_type" ]; then
+        echo -e "${RED}ERROR: Token doesn't contain valid OAuth data.${NC}"
+        exit 1
+    fi
+
+    # Warn if subscription type doesn't match expected
+    local expected
+    expected="$(expected_sub_type "$target_profile")"
+    if [ -n "$expected" ] && [ "$sub_type" != "$expected" ]; then
+        echo -e "${YELLOW}WARNING: Expected $expected token for $target_profile profile, got: $sub_type${NC}"
+        echo "Did you sign in with the correct account?"
+        echo -n "Proceed anyway? (y/N) "
+        read -r confirm
+        [ "$confirm" = "y" ] || exit 1
+    fi
+
+    # Persist new token and metadata to target profile
+    echo "$token" > "$target_dir/.auth-token"
+    chmod 600 "$target_dir/.auth-token"
+    update_profile_meta "$target_dir"
+
+    # Restore original keychain token
+    restore_keychain_token "$original_token"
+    trap - EXIT
+
+    echo ""
+    echo -e "${GREEN}New token saved to $target_dir/.auth-token${NC}"
+    load_profile_meta "$target_dir"
+    echo -e "  Refreshed: $target_profile ($PROFILE_EMAIL)"
+
+    local current_dir
+    current_dir="$(get_profile_dir "$current_profile")"
+    if load_profile_meta "$current_dir"; then
+        echo -e "  Active:    $current_profile ($PROFILE_EMAIL)"
+    else
+        echo -e "  Active:    $current_profile"
+    fi
+}
+
+# Clear keychain, prompt, run claude auth login, introspect result.
+# Sets globals: _TOKEN, _EMAIL, _ORG, _SUB_TYPE, _DISPLAY
+# Returns non-zero on failure.
+do_interactive_login() {
+    security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" >/dev/null 2>&1 || true
+    echo -n "  Press Enter to open the browser... "
+    read -r
+    claude auth login || { echo -e "${RED}Login failed.${NC}"; return 1; }
+    _TOKEN="$(security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null || true)"
+    if [ -z "$_TOKEN" ]; then
+        echo -e "${RED}ERROR: No token found after login.${NC}"
+        return 1
+    fi
+    introspect_token "$_TOKEN"
+    echo ""
+    echo -e "  Authenticated as: ${GREEN}$_DISPLAY${NC}"
+}
+
+# init: first-time interactive setup
+init_cmd() {
+    echo "Claude Code Profile Switcher — First-Time Setup"
+    echo "================================================"
+    echo ""
+
+    # ── Check preconditions ──
+    if [ -L "$LINK" ]; then
+        echo -e "${YELLOW}~/.claude is already a symlink (profiles may already be set up).${NC}"
+        echo "Current target: $(readlink "$LINK")"
+        echo ""
+        echo -n "Continue anyway? This will re-capture tokens. (y/N) "
+        read -r confirm
+        [ "$confirm" = "y" ] || exit 0
+        echo ""
+        recapture_existing
+        return
+    fi
+
+    if [ ! -d "$LINK" ]; then
+        echo -e "${RED}ERROR: ~/.claude does not exist.${NC}"
+        echo "Run 'claude auth login' first to create it, then re-run init."
+        exit 1
+    fi
+
+    echo "This will set up two profiles so you can switch between"
+    echo "Anthropic accounts (e.g., work + personal) with one command."
+    echo ""
+    echo "~/.claude will become a symlink to the active profile."
+    echo "You'll authenticate both accounts via OAuth in your browser."
+    echo ""
+
+    # ── Backup ──
+    local backup_dir="$HOME/.claude-backup-$(date +%Y%m%d%H%M%S)"
+    echo -e "${BLUE}Backing up ~/.claude...${NC}"
+    cp -a "$LINK" "$backup_dir"
+    echo "  Saved to: $backup_dir"
+    echo ""
+    echo "  If anything goes wrong, restore with:"
+    echo "    rm -rf ~/.claude ~/.claude-work ~/.claude-personal"
+    echo "    mv $backup_dir ~/.claude"
+    echo ""
+
+    # ──────────────────────────────────────────────────────────────
+    # Step 1: Authenticate first account
+    # ──────────────────────────────────────────────────────────────
+    echo -e "${BLUE}Step 1 of 4: Authenticate first account${NC}"
+    echo "────────────────────────────────────────"
+    echo ""
+
+    local token1 email1 org1 sub1
+
+    # Check for existing valid token
+    token1="$(security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null || true)"
+    local need_login=true
+
+    if [ -n "$token1" ]; then
+        introspect_token "$token1"
+        if [ "$_EMAIL" != "unknown" ]; then
+            email1="$_EMAIL"; org1="$_ORG"; sub1="$_SUB_TYPE"
+            echo -e "  You're currently authenticated as: ${GREEN}$_DISPLAY${NC}"
+            echo -n "  Use this as your first account? (Y/n) "
+            read -r use_existing
+            if [ "$use_existing" != "n" ] && [ "$use_existing" != "N" ]; then
+                need_login=false
+            fi
+        fi
+    fi
+
+    if [ "$need_login" = true ]; then
+        echo "  A browser window will open for OAuth authentication."
+        echo "  Make sure you're logged into the correct account on claude.ai."
+        echo ""
+        do_interactive_login || exit 1
+        token1="$_TOKEN"; email1="$_EMAIL"; org1="$_ORG"; sub1="$_SUB_TYPE"
+    fi
+
+    echo ""
+    echo -n "  Is this correct? (Y/n) "
+    read -r confirm1
+    if [ "$confirm1" = "n" ] || [ "$confirm1" = "N" ]; then
+        echo "  Let's try again."
+        echo ""
+        do_interactive_login || exit 1
+        token1="$_TOKEN"; email1="$_EMAIL"; org1="$_ORG"; sub1="$_SUB_TYPE"
+    fi
+
+    # Suggest profile name
+    local suggest1="work"
+    case "$sub1" in
+        pro|max) suggest1="personal" ;;
+        team|enterprise) suggest1="work" ;;
+    esac
+    echo -n "  Profile name for this account? [$suggest1]: "
+    read -r name1
+    name1="${name1:-$suggest1}"
+
+    echo ""
+
+    # ──────────────────────────────────────────────────────────────
+    # Step 2: Prepare second account
+    # ──────────────────────────────────────────────────────────────
+    echo -e "${BLUE}Step 2 of 4: Prepare second account${NC}"
+    echo "────────────────────────────────────"
+    echo ""
+    echo "  Now we need to authenticate your second Anthropic account."
+    echo ""
+    echo "  Before we open the browser, you need to switch accounts"
+    echo "  on claude.ai:"
+    echo ""
+    echo "    1. Go to claude.ai in your browser"
+    echo "    2. Click your profile icon (bottom-left) → Log out"
+    echo "    3. Log in with your OTHER Anthropic account"
+    echo "       (the one that is NOT $email1)"
+    echo ""
+    echo -n "  Press Enter when you've switched accounts in the browser... "
+    read -r
+
+    echo ""
+
+    # ──────────────────────────────────────────────────────────────
+    # Step 3: Authenticate second account
+    # ──────────────────────────────────────────────────────────────
+    echo -e "${BLUE}Step 3 of 4: Authenticate second account${NC}"
+    echo "─────────────────────────────────────────"
+    echo ""
+    echo "  Opening the browser for OAuth. It will pick up whichever"
+    echo "  account you just signed into on claude.ai."
+    echo ""
+
+    local token2 email2 org2 sub2
+
+    while true; do
+        do_interactive_login || { restore_keychain_token "$token1"; exit 1; }
+        token2="$_TOKEN"; email2="$_EMAIL"; org2="$_ORG"; sub2="$_SUB_TYPE"
+
+        # Verify it's a different account
+        if [ "$email2" = "$email1" ]; then
+            echo ""
+            echo -e "  ${YELLOW}That's the same account as Step 1 ($email1).${NC}"
+            echo "  You need to log into a DIFFERENT account on claude.ai first."
+            echo ""
+            echo "    1. Go to claude.ai in your browser"
+            echo "    2. Log out and sign in with your other account"
+            echo ""
+            echo -n "  Try again? (Y/n) "
+            read -r retry
+            if [ "$retry" = "n" ] || [ "$retry" = "N" ]; then
+                restore_keychain_token "$token1"
+                exit 1
+            fi
+            echo ""
+            continue
+        fi
+
+        # Confirm
+        echo -n "  Is this correct? (Y/n) "
+        read -r confirm2
+        if [ "$confirm2" = "n" ] || [ "$confirm2" = "N" ]; then
+            echo "  Let's try again. Switch to the correct account on claude.ai."
+            echo ""
+            continue
+        fi
+
+        break
+    done
+
+    # Suggest profile name
+    local suggest2="personal"
+    [ "$name1" = "personal" ] && suggest2="work"
+    echo -n "  Profile name for this account? [$suggest2]: "
+    read -r name2
+    name2="${name2:-$suggest2}"
+
+    if [ "$name1" = "$name2" ]; then
+        echo -e "${RED}  ERROR: Both profiles can't have the same name '$name1'.${NC}"
+        restore_keychain_token "$token1"
+        exit 1
+    fi
+
+    echo ""
+
+    # ──────────────────────────────────────────────────────────────
+    # Step 4: Create profiles
+    # ──────────────────────────────────────────────────────────────
+    echo -e "${BLUE}Step 4 of 4: Create profiles${NC}"
+    echo "────────────────────────────"
+    echo ""
+
+    local dir1="$HOME/.claude-${name1}"
+    local dir2="$HOME/.claude-${name2}"
+
+    # Move current ~/.claude to first profile
+    echo "  Moving ~/.claude → $dir1"
+    mv "$LINK" "$dir1"
+
+    # Create symlink immediately
+    ln -s "$dir1" "$LINK"
+
+    # Save first account's token and metadata.
+    # Use write_profile_meta (not update_profile_meta) because `claude auth status`
+    # reads from the running process's in-memory state, which still reflects the
+    # Step 3 login — not the keychain. We already captured email1/org1/sub1 in Step 1.
+    echo "  Saving $name1 credentials ($email1)..."
+    echo "$token1" > "$dir1/.auth-token"
+    chmod 600 "$dir1/.auth-token"
+    write_profile_meta "$dir1" "$email1" "$org1" "$sub1"
+
+    # Clone for second profile
+    echo "  Cloning $dir1 → $dir2"
+    cp -a "$dir1" "$dir2"
+
+    # Save second account's token and metadata (from Step 3 captures)
+    echo "  Saving $name2 credentials ($email2)..."
+    echo "$token2" > "$dir2/.auth-token"
+    chmod 600 "$dir2/.auth-token"
+    write_profile_meta "$dir2" "$email2" "$org2" "$sub2"
+
+    # Clear second profile's history and project memory
+    rm -f "$dir2/history.jsonl"
+    rm -rf "$dir2/projects"
+    mkdir -p "$dir2/projects"
+
+    echo ""
+
+    # Set active profile
+    echo -n "  Which profile should be active? [$name1]: "
+    read -r active
+    active="${active:-$name1}"
+
+    local active_dir="$HOME/.claude-${active}"
+    rm "$LINK"
+    ln -s "$active_dir" "$LINK"
+    load_token "$active_dir"
+
+    echo ""
+    echo -e "${GREEN}════════════════════════════════════════${NC}"
+    echo -e "${GREEN}  Setup complete!${NC}"
+    echo -e "${GREEN}════════════════════════════════════════${NC}"
+    echo ""
+    show_status
+    echo ""
+    echo "  Switch profiles:  claude-switch $name1"
+    echo "                    claude-switch $name2"
+    echo "  Check status:     claude-switch status"
+    echo ""
+    echo "  Backup is at: $backup_dir"
+    echo "  Once you've verified everything works, you can delete it."
+}
+
+# Re-capture tokens for existing profile setup
+recapture_existing() {
+    local current
+    current="$(get_current)"
+    local current_dir
+    current_dir="$(readlink "$LINK")"
+
+    echo "Saving current profile ($current) metadata..."
+    save_current_token "$current_dir"
+    update_profile_meta "$current_dir"
+
+    echo ""
+    echo -e "${GREEN}Updated $current profile.${NC}"
+    show_status
+    echo ""
+    echo "To update the other profile, run: claude-switch --refresh <profile>"
+}
+
+# ─── Main ──────────────────────────────────────────────────────────
+
+case "${1:-}" in
+    personal|work) switch_profile "$1" ;;
+    status)
+        echo "Claude Code Profile Status"
+        echo "=========================="
+        show_status
+        ;;
+    init)
+        init_cmd
+        ;;
+    --refresh)
+        refresh_cmd "${2:-}"
+        ;;
+    --save)
+        save_token_cmd
+        ;;
+    *) usage ;;
+esac
