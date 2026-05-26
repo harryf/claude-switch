@@ -41,11 +41,14 @@ get_current() {
             *)           echo "unknown" ;;
         esac
     elif [ -d "$LINK" ]; then
-        echo "ERROR: ~/.claude is a real directory, not a symlink."
-        echo "Run 'claude-switch init' to set up profiles."
+        # Errors must go to stderr — get_current is called via $() in most
+        # callers, which would otherwise swallow stdout error text. Without
+        # this, `set -e` on the next `readlink` kills the script silently.
+        echo "ERROR: ~/.claude is a real directory, not a symlink." >&2
+        echo "Run 'claude-switch init' to set up profiles." >&2
         exit 1
     else
-        echo "ERROR: ~/.claude does not exist."
+        echo "ERROR: ~/.claude does not exist." >&2
         exit 1
     fi
 }
