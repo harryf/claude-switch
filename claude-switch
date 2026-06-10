@@ -23,6 +23,7 @@ usage() {
     echo "  work               Switch to work profile"
     echo "  status             Show which profile is active"
     echo "  init               First-time setup (create profiles, capture tokens)"
+    echo "  repair             Restore the ~/.claude symlink after an update reverted it"
     echo "  --refresh          Re-login current profile and persist new token"
     echo "  --refresh <profile> Re-login a specific profile without leaving current one"
     echo "  --save             Persist current keychain token to active profile"
@@ -45,7 +46,11 @@ get_current() {
         # callers, which would otherwise swallow stdout error text. Without
         # this, `set -e` on the next `readlink` kills the script silently.
         echo "ERROR: ~/.claude is a real directory, not a symlink." >&2
-        echo "Run 'claude-switch init' to set up profiles." >&2
+        if [ -d "$PERSONAL_DIR" ] || [ -d "$WORK_DIR" ]; then
+            echo "Profiles already exist — run 'claude-switch repair' to restore the symlink." >&2
+        else
+            echo "Run 'claude-switch init' to set up profiles." >&2
+        fi
         exit 1
     else
         echo "ERROR: ~/.claude does not exist." >&2
@@ -729,6 +734,105 @@ recapture_existing() {
     echo "To update the other profile, run: claude-switch --refresh <profile>"
 }
 
+# repair: restore the ~/.claude symlink after an update reverted it to a real
+# directory. Unlike init, this assumes the profile directories already exist and
+# leaves them untouched — it only moves the stray real ~/.claude aside and
+# recreates the symlink.
+repair_cmd() {
+    echo "Claude Code Profile Switcher — Repair"
+    echo "====================================="
+    echo ""
+
+    # Already a symlink? Nothing to repair.
+    if [ -L "$LINK" ]; then
+        echo -e "${GREEN}~/.claude is already a symlink — nothing to repair.${NC}"
+        echo "Current target: $(readlink "$LINK")"
+        exit 0
+    fi
+
+    if [ ! -e "$LINK" ]; then
+        echo -e "${RED}ERROR: ~/.claude does not exist.${NC}"
+        echo "Run 'claude-switch init' for first-time setup."
+        exit 1
+    fi
+
+    # It's a real directory. We need at least one profile to point at.
+    if [ ! -d "$PERSONAL_DIR" ] && [ ! -d "$WORK_DIR" ]; then
+        echo -e "${RED}ERROR: No profile directories found.${NC}"
+        echo "Expected $PERSONAL_DIR or $WORK_DIR."
+        echo "Run 'claude-switch init' for first-time setup."
+        exit 1
+    fi
+
+    echo "~/.claude is a real directory, not a symlink. This usually happens"
+    echo "when a Claude Code update replaces the symlink with a fresh directory."
+    echo ""
+    echo "Repair will:"
+    echo "  1. Move the real ~/.claude aside (kept as a backup, not deleted)"
+    echo "  2. Recreate ~/.claude as a symlink to a profile"
+    echo "  3. Load that profile's saved token into the keychain"
+    echo ""
+    echo "Your profile directories will NOT be modified."
+    echo ""
+
+    # Suggest a default profile by matching the current keychain token's
+    # subscription type against each profile's saved .profile-meta.
+    local suggested=""
+    local token
+    token="$(security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null || true)"
+    if [ -n "$token" ]; then
+        local sub_type
+        sub_type="$(get_token_sub_type "$token")"
+        if [ -n "$sub_type" ]; then
+            if [ -d "$PERSONAL_DIR" ] && [ "$(expected_sub_type personal)" = "$sub_type" ]; then
+                suggested="personal"
+            elif [ -d "$WORK_DIR" ] && [ "$(expected_sub_type work)" = "$sub_type" ]; then
+                suggested="work"
+            fi
+        fi
+    fi
+    # Fall back to whichever profile exists.
+    if [ -z "$suggested" ]; then
+        [ -d "$WORK_DIR" ] && suggested="work" || suggested="personal"
+    fi
+
+    echo -n "  Which profile should be active? [$suggested]: "
+    read -r target_profile
+    target_profile="${target_profile:-$suggested}"
+
+    local target_dir
+    target_dir="$(get_profile_dir "$target_profile")"
+    if [ -z "$target_dir" ] || [ ! -d "$target_dir" ]; then
+        echo -e "${RED}ERROR: Profile '$target_profile' directory not found.${NC}"
+        echo "Choose 'personal' or 'work' (a directory must already exist)."
+        exit 1
+    fi
+
+    check_claude_processes
+
+    # Move the real directory aside to a timestamped backup.
+    local backup_dir="$HOME/.claude-realdir-backup-$(date +%Y%m%d%H%M%S)"
+    echo ""
+    echo -e "${BLUE}Moving real ~/.claude → $backup_dir${NC}"
+    mv "$LINK" "$backup_dir"
+
+    # Recreate the symlink and load the profile's token.
+    echo "Linking ~/.claude → $target_dir"
+    ln -s "$target_dir" "$LINK"
+    echo "Loading $target_profile credentials..."
+    load_token "$target_dir"
+
+    echo ""
+    echo -e "${GREEN}Repair complete.${NC}"
+    show_status
+    echo ""
+    echo "  The old real directory was saved to:"
+    echo "    $backup_dir"
+    echo "  Delete it once you've confirmed switching works."
+    echo ""
+    echo -e "${YELLOW}NOTE: Restart any running Claude Code sessions for changes to take effect.${NC}"
+}
+
 # ─── Main ──────────────────────────────────────────────────────────
 
 case "${1:-}" in
@@ -740,6 +844,9 @@ case "${1:-}" in
         ;;
     init)
         init_cmd
+        ;;
+    repair)
+        repair_cmd
         ;;
     --refresh)
         refresh_cmd "${2:-}"

@@ -60,6 +60,7 @@ PROFILE_SUB_TYPE="team"
 | `--refresh` | `refresh_cmd()` | Re-authenticates via `claude auth login`, validates token type, persists |
 | `--refresh <profile>` | `refresh_other()` | Saves current keychain token, authenticates as other profile, persists, restores original (with trap safety) |
 | `--save` | `save_token_cmd()` | Persists whatever is currently in the keychain to the active profile |
+| `repair` | `repair_cmd()` | Restores the symlink when `~/.claude` has reverted to a real directory (e.g. after a Claude Code update): moves the real dir aside to a timestamped backup, relinks `~/.claude` to an existing profile, and loads its token. Leaves profile dirs untouched. |
 
 #### Init Flow
 

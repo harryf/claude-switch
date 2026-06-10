@@ -117,9 +117,12 @@ claude-switch --refresh           # Re-login current profile, persist new token
 claude-switch --refresh work      # Re-login work profile while staying on personal
 claude-switch --save              # Persist current keychain token to active profile
 claude-switch init                # First-time interactive setup
+claude-switch repair              # Restore the ~/.claude symlink after an update reverted it
 ```
 
 After switching, restart any running Claude Code sessions.
+
+> **Tip:** A Claude Code update can replace the `~/.claude` symlink with a fresh real directory, breaking switching. When that happens, run `claude-switch repair` (not `init`) — it moves the stray directory aside as a backup and relinks `~/.claude` to your existing profile without touching the profile directories.
 
 ### Claude Desktop
 
